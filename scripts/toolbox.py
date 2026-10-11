@@ -19,17 +19,22 @@ is not silently lost, and the exit code is truthful.
 """
 
 import argparse
+import copy
+import ctypes
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
+import urllib.request
 
 sys.dont_write_bytecode = True
 
 CONFIG_ENV = 'BROWSER_TOOLBOX_CONFIG'
 CONFIG_RELATIVE = Path('browser-task-router') / 'runtime.json'
+LEGACY_CONFIG = Path.home() / '.config' / 'browser-task-router' / 'runtime.json'
 SHELL_NAMES = {'cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe',
                'bash', 'sh', 'zsh', 'fish', 'wsl', 'wsl.exe'}
 SHELL_SUFFIXES = {'.cmd', '.bat', '.ps1'}
@@ -48,6 +53,8 @@ def default_config_path():
 
 def load_config(path=None):
     target = Path(path).expanduser() if path else default_config_path()
+    if not target.is_file() and LEGACY_CONFIG.is_file():
+        target = LEGACY_CONFIG
     if not target.is_file():
         raise FileNotFoundError(
             'No toolbox config at ' + str(target)
@@ -114,6 +121,155 @@ def inspect_provider(provider):
     }
 
 
+def owned_browser_config(config):
+    """True when the config describes an owned, extension-loaded Chromium."""
+    return all(key in config for key in ('runtime_root', 'chromium_executable', 'bsk_extension'))
+
+
+def process_alive(process_id):
+    if os.name != 'nt':
+        try:
+            os.kill(process_id, 0)
+            return True
+        except ProcessLookupError:
+            return False
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    kernel.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel.OpenProcess(0x1000, False, process_id)
+    if not handle:
+        return ctypes.get_last_error() == 5
+    try:
+        exit_code = ctypes.c_ulong()
+        if not kernel.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            raise RuntimeError('Cannot verify owned browser process')
+        return exit_code.value == 259
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def ensure_bsk_daemon(config):
+    """Start the BrowserSkill daemon exactly once, or reuse the live one.
+
+    Returns daemon status on success, or None when this install has no
+    BSK_HOME to manage and the caller should simply pass through.
+    """
+    provider = copy.deepcopy(config['providers']['browser-skill'])
+    env = provider.setdefault('env', {})
+    if 'BSK_HOME' not in env:
+        return None
+    env['BSK_AUTO_START'] = '0'
+    result = execute(provider, ['status', '--json'], capture=True, timeout=8)
+    if result.returncode == 0:
+        return json.loads(result.stdout)
+    daemon_home = Path(env['BSK_HOME']).resolve()
+    info = daemon_home / 'daemon.json'
+    if info.exists():
+        metadata = json.loads(info.read_text(encoding='utf-8'))
+        if process_alive(metadata['pid']):
+            raise RuntimeError('BrowserSkill daemon is alive but its status failed; no automatic restart')
+    elif 'automatic daemon startup is disabled' not in result.stdout + result.stderr:
+        raise RuntimeError('BrowserSkill status did not prove daemon absence; inspect the error before starting')
+    daemon_home.mkdir(parents=True, exist_ok=True)
+    lock = daemon_home / 'toolbox-start.lock'
+    try:
+        with lock.open('x', encoding='utf-8') as stream:
+            stream.write(str(os.getpid()))
+    except FileExistsError:
+        raise RuntimeError('BrowserSkill startup already pending; do not start another daemon')
+    try:
+        environment = os.environ.copy()
+        environment.update(env)
+        options = {'env': environment, 'stdin': subprocess.DEVNULL,
+                   'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
+        if os.name == 'nt' and hasattr(subprocess, 'CREATE_NO_WINDOW'):
+            options['creationflags'] = subprocess.CREATE_NO_WINDOW
+        process = subprocess.Popen([*provider['command'], 'daemon', 'start', '--foreground'], **options)
+        (daemon_home / 'toolbox-process.json').write_text(json.dumps({'pid': process.pid}), encoding='utf-8')
+        for attempt in range(15):
+            result = execute(provider, ['status', '--json'], capture=True, timeout=8)
+            if result.returncode == 0:
+                return json.loads(result.stdout)
+            if process.poll() is not None:
+                raise RuntimeError('Owned BrowserSkill daemon exited during startup; inspect bsk logs')
+            time.sleep(0.3)
+        raise RuntimeError('Owned BrowserSkill daemon is still starting; inspect its PID instead of repeating startup')
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def browser_endpoint(profile):
+    active_port = profile / 'DevToolsActivePort'
+    if not active_port.is_file():
+        return None
+    lines = active_port.read_text(encoding='utf-8').splitlines()
+    if len(lines) < 2 or not lines[0].isdigit() or not lines[1].startswith('/devtools/browser/'):
+        return None
+    endpoint = 'http://127.0.0.1:' + lines[0]
+    try:
+        with urllib.request.urlopen(endpoint + '/json/version', timeout=2) as response:
+            metadata = json.load(response)
+        if metadata.get('webSocketDebuggerUrl', '').endswith(lines[1]):
+            return endpoint
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def ensure_browser(config):
+    """Start or reuse one owned headless Chromium and return its CDP endpoint."""
+    if not owned_browser_config(config):
+        raise ValueError('browser-endpoint requires runtime_root, chromium_executable and bsk_extension in the config')
+    root = Path(config['runtime_root']).resolve()
+    profile = root / 'state' / 'chromium-profile'
+    profile.mkdir(parents=True, exist_ok=True)
+    endpoint = browser_endpoint(profile)
+    if endpoint:
+        return endpoint
+    receipt_path = root / 'state' / 'browser-process.json'
+    if receipt_path.exists():
+        receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
+        if process_alive(receipt['pid']):
+            raise RuntimeError('Owned browser is still running but CDP is unavailable; do not restart or attach a working browser')
+    lock = root / 'state' / 'browser-start.lock'
+    try:
+        with lock.open('x', encoding='utf-8') as stream:
+            stream.write(str(os.getpid()))
+    except FileExistsError:
+        for attempt in range(15):
+            endpoint = browser_endpoint(profile)
+            if endpoint:
+                return endpoint
+            time.sleep(0.5)
+        raise RuntimeError('Another browser start is pending; inspect its process before retrying')
+    try:
+        executable = Path(config['chromium_executable'])
+        extension = Path(config['bsk_extension'])
+        if not executable.is_file() or not (extension / 'manifest.json').is_file():
+            raise RuntimeError('Chromium or BrowserSkill extension is missing')
+        command = [str(executable), '--headless=new', '--no-first-run', '--no-default-browser-check',
+                   '--remote-debugging-port=0', '--remote-debugging-address=127.0.0.1',
+                   '--user-data-dir=' + str(profile),
+                   '--disable-extensions-except=' + str(extension),
+                   '--load-extension=' + str(extension), 'about:blank']
+        options = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
+        if os.name == 'nt' and hasattr(subprocess, 'CREATE_NO_WINDOW'):
+            options['creationflags'] = subprocess.CREATE_NO_WINDOW
+        process = subprocess.Popen(command, **options)
+        receipt_path.write_text(json.dumps({'pid': process.pid, 'profile': str(profile), 'executable': str(executable)}), encoding='utf-8')
+        for attempt in range(30):
+            endpoint = browser_endpoint(profile)
+            if endpoint:
+                return endpoint
+            if process.poll() is not None:
+                raise RuntimeError('Owned Chromium exited before its CDP endpoint became available')
+            time.sleep(0.5)
+        raise RuntimeError('Owned Chromium is still starting; inspect it before starting another process')
+    finally:
+        lock.unlink(missing_ok=True)
+
+
 def build_eval_request(tool, code=None, url=None):
     """Translate a neutral request into the chosen provider's own invocation."""
     if not code and not url:
@@ -174,6 +330,8 @@ def build_parser():
     run_parser.add_argument('provider')
     run_parser.add_argument('arguments', nargs=argparse.REMAINDER)
 
+    subparsers.add_parser('browser-endpoint', help='Start or reuse the owned headless Chromium and print its CDP endpoint')
+
     eval_parser = subparsers.add_parser('eval-url', help='Read a URL or run JavaScript in a page context')
     eval_parser.add_argument('--with', dest='tool', required=True, help='Provider name to use')
     eval_parser.add_argument('--url', help='Fetch this URL from inside the page context')
@@ -214,10 +372,29 @@ def main(argv=None):
         print(json.dumps({'provider': args.tool, **request}, ensure_ascii=False))
         return 0
 
+    if args.operation == 'browser-endpoint':
+        print(ensure_browser(config))
+        return 0
+
     if args.provider not in providers:
         raise KeyError('Unknown provider: ' + args.provider)
     arguments = args.arguments[1:] if args.arguments[:1] == ['--'] else args.arguments
-    return execute(providers[args.provider], arguments).returncode
+    provider = copy.deepcopy(providers[args.provider])
+    if args.provider == 'browser-skill' and owned_browser_config(config):
+        env = provider.setdefault('env', {})
+        if 'BSK_HOME' in env:
+            env['BSK_AUTO_START'] = '0'
+        if arguments[:2] == ['session', 'start']:
+            if 'BSK_HOME' in env:
+                ensure_bsk_daemon(config)
+            ensure_browser(config)
+            if '--no-focus' not in arguments:
+                arguments = [*arguments, '--no-focus']
+    if args.provider == 'browser-use' and owned_browser_config(config) and not any(
+        value in {'--help', '-h', '--version', 'skill', 'telemetry', 'auth'} for value in arguments
+    ):
+        provider.setdefault('env', {})['BU_CDP_URL'] = ensure_browser(config)
+    return execute(provider, arguments).returncode
 
 
 if __name__ == '__main__':

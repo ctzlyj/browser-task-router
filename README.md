@@ -39,6 +39,7 @@ python scripts/setup.py --force
 python scripts/toolbox.py status
 python scripts/toolbox.py run webcli -- list
 python scripts/toolbox.py run playwright-cli -- -s=demo open https://example.com
+python scripts/toolbox.py browser-endpoint
 ```
 
 接口优先的调用方式（在页面上下文里发请求，自动带上页面自己的会话）：

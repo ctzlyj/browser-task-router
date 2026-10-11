@@ -1,9 +1,11 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts' / 'toolbox.py'
@@ -93,8 +95,57 @@ class ToolboxTests(unittest.TestCase):
             self.assertIn('x', config['providers'])
 
     def test_missing_config_raises_with_hint(self):
-        with self.assertRaises(FileNotFoundError):
-            self.toolbox.load_config(Path(tempfile.gettempdir()) / 'definitely-absent-runtime.json')
+        with patch.object(self.toolbox, 'LEGACY_CONFIG', Path(tempfile.gettempdir()) / 'definitely-absent-legacy.json'):
+            with self.assertRaises(FileNotFoundError):
+                self.toolbox.load_config(Path(tempfile.gettempdir()) / 'definitely-absent-runtime.json')
+
+    def test_legacy_config_location_is_used_as_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            legacy = Path(directory) / 'runtime.json'
+            legacy.write_text(json.dumps({'providers': {}}), encoding='utf-8')
+            with patch.object(self.toolbox, 'LEGACY_CONFIG', legacy):
+                with patch.object(self.toolbox, 'default_config_path', return_value=Path(directory) / 'absent-primary.json'):
+                    config = self.toolbox.load_config()
+            self.assertEqual(config, {'providers': {}})
+
+    def test_owned_browser_config_requires_all_keys(self):
+        self.assertFalse(self.toolbox.owned_browser_config({'runtime_root': 'x'}))
+        self.assertTrue(self.toolbox.owned_browser_config({
+            'runtime_root': 'x', 'chromium_executable': 'y', 'bsk_extension': 'z'}))
+
+    def test_bsk_managed_startup_skips_without_bsk_home(self):
+        config = {'providers': {'browser-skill': {'command': [sys.executable], 'env': {}}}}
+        self.assertIsNone(self.toolbox.ensure_bsk_daemon(config))
+
+    def test_existing_bsk_daemon_is_reused_without_spawning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = {'providers': {'browser-skill': {'command': [sys.executable], 'env': {'BSK_HOME': directory}}}}
+            response = subprocess.CompletedProcess([], 0, '{"pid": 123, "sessions": []}', '')
+            with patch.object(self.toolbox, 'execute', return_value=response), patch.object(self.toolbox.subprocess, 'Popen') as spawn:
+                self.toolbox.ensure_bsk_daemon(config)
+                spawn.assert_not_called()
+
+    def test_unresponsive_live_bsk_daemon_is_not_restarted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'daemon.json').write_text('{"pid": 123}', encoding='utf-8')
+            config = {'providers': {'browser-skill': {'command': [sys.executable], 'env': {'BSK_HOME': directory}}}}
+            response = subprocess.CompletedProcess([], 1, '', 'connection unavailable')
+            with patch.object(self.toolbox, 'execute', return_value=response), patch.object(self.toolbox, 'process_alive', return_value=True), patch.object(self.toolbox.subprocess, 'Popen') as spawn:
+                with self.assertRaises(RuntimeError):
+                    self.toolbox.ensure_bsk_daemon(config)
+                spawn.assert_not_called()
+
+    def test_bsk_absence_message_starts_one_managed_daemon(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = {'providers': {'browser-skill': {'command': [sys.executable], 'env': {'BSK_HOME': directory}}}}
+            absent = subprocess.CompletedProcess([], 2, '{"message":"automatic daemon startup is disabled (BSK_AUTO_START=0)","exit_code":2}', '')
+            ready = subprocess.CompletedProcess([], 0, '{"pid":123,"sessions":[]}', '')
+            with patch.object(self.toolbox, 'execute', side_effect=[absent, ready]), patch.object(self.toolbox.subprocess, 'Popen') as spawn:
+                spawn.return_value.pid = 123
+                self.toolbox.ensure_bsk_daemon(config)
+                spawn.assert_called_once()
+                self.assertEqual(spawn.call_args.args[0][-3:], ['daemon', 'start', '--foreground'])
 
 
 if __name__ == '__main__':
