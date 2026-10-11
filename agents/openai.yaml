@@ -1,0 +1,5 @@
+interface:
+  display_name: "Browser + Interface Automation Router"
+  short_description: "One entry for WebCLI, BrowserSkill, Browser-Use, Browser-Act and Playwright"
+policy:
+  allow_implicit_invocation: true

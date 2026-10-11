@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.playwright-cli/
+.playwright-mcp/
+runtime.json
+local_cli.json
+upstream-baselines/
+candidates/
+
