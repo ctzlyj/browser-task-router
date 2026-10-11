@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -41,6 +42,18 @@ class SetupTests(unittest.TestCase):
         names = [entry['name'] for entry in aliases]
         self.assertIn('browser-toolbox-local', names)
         self.assertIn('webcli-local', names)
+
+    def test_extra_roots_come_from_the_environment(self):
+        sentinel = str(Path(tempfile.gettempdir()) / 'btr-sentinel-tools')
+        previous = os.environ.get('BROWSER_TOOLBOX_ROOTS')
+        os.environ['BROWSER_TOOLBOX_ROOTS'] = sentinel
+        try:
+            self.assertIn(sentinel, self.setup.default_roots())
+        finally:
+            if previous is None:
+                os.environ.pop('BROWSER_TOOLBOX_ROOTS', None)
+            else:
+                os.environ['BROWSER_TOOLBOX_ROOTS'] = previous
 
     def test_setup_writes_a_usable_config(self):
         with tempfile.TemporaryDirectory() as directory:

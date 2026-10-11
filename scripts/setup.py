@@ -14,6 +14,7 @@ point at a specific install with --webcli-root / --python-root.
 
 import argparse
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -31,11 +32,34 @@ def import_toolbox():
 
 
 def default_roots():
+    """Common install locations, plus anything in BROWSER_TOOLBOX_ROOTS."""
     home = Path.home()
     roots = [home / 'tools', home / '.local' / 'bin']
     if sys.platform == 'darwin':
         roots.append(Path('/opt/homebrew/bin'))
-    return [str(root) for root in roots]
+        roots.append(Path('/usr/local/bin'))
+    if os.name == 'nt':
+        local = Path(os.environ.get('LOCALAPPDATA') or (home / 'AppData' / 'Local'))
+        roaming = Path(os.environ.get('APPDATA') or (home / 'AppData' / 'Roaming'))
+        roots.extend([
+            local / 'Programs',
+            local / 'Programs' / 'Python' / 'Scripts',
+            roaming / 'npm',
+            home / 'scoop' / 'shims',
+            Path('C:/Program Files'),
+            Path('C:/Tools'),
+        ])
+    for item in (os.environ.get('BROWSER_TOOLBOX_ROOTS') or '').split(os.pathsep):
+        if item.strip():
+            roots.append(Path(item.strip()))
+    seen = set()
+    unique = []
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            unique.append(str(root))
+    return unique
 
 
 def candidate_bins(extra_roots):
